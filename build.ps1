@@ -21,6 +21,9 @@ param(
 # Configuration
 # ============================================================================
 $UV4 = "d:\MDK_ARM\Keil_v5\UV4\UV4.exe"
+if (-not [string]::IsNullOrWhiteSpace($env:KEIL_UV4)) {
+    $UV4 = $env:KEIL_UV4
+}
 $ProjectDir = Join-Path $PSScriptRoot "MDK-ARM"
 
 function Resolve-UvprojFile {
@@ -241,16 +244,22 @@ $errors = @()
 $warningCount = 0
 $errorCount = 0
 $logLines = @()
+$summaryFound = $false
 
 if (Test-Path $cfg.LogFile) {
     $logLines = Get-Content $cfg.LogFile -Encoding UTF8 -ErrorAction SilentlyContinue
 
     foreach ($line in $logLines) {
+        if ($line -match "(\d+)\s+Error\(s\),\s+(\d+)\s+Warning\(s\)") {
+            $errorCount = [int]$Matches[1]
+            $warningCount = [int]$Matches[2]
+            $summaryFound = $true
+        }
         if ($line -match ":\s+error") {
             $errors += $line.Trim()
-            $errorCount++
+            if (-not $summaryFound) { $errorCount++ }
         }
-        if ($line -match ":\s+warning") {
+        if ((-not $summaryFound) -and ($line -match ":\s+warning")) {
             $warningCount++
         }
     }
@@ -304,12 +313,13 @@ $line = "=" * 60
 $elapsedStr = "{0}m {1}s" -f [math]::Floor($elapsed.TotalMinutes), $elapsed.Seconds
 
 Write-Host $line -ForegroundColor Cyan
+$diagnostics = "$errorCount errors, $warningCount warnings"
 if ($exitCode -eq 0) {
-    Write-Host "  BUILD OK  ($elapsedStr)" -ForegroundColor Green
+    Write-Host "  BUILD OK  ($elapsedStr, $diagnostics)" -ForegroundColor Green
 } elseif ($exitCode -eq 1) {
-    Write-Host "  BUILD OK  ($elapsedStr, $warningCount warnings)" -ForegroundColor Yellow
+    Write-Host "  BUILD OK  ($elapsedStr, $diagnostics)" -ForegroundColor Yellow
 } else {
-    Write-Host "  BUILD FAILED  ($elapsedStr, $errorCount errors)" -ForegroundColor Red
+    Write-Host "  BUILD FAILED  ($elapsedStr, $diagnostics)" -ForegroundColor Red
 }
 Write-Host $line -ForegroundColor Cyan
 
