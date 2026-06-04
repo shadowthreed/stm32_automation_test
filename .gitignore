@@ -1,0 +1,71 @@
+# STM32 / Keil MDK build outputs
+MDK-ARM/*/
+!MDK-ARM/RTE/
+MDK-ARM/*.lst
+MDK-ARM/*.map
+MDK-ARM/*.htm
+MDK-ARM/*.lnp
+MDK-ARM/*.sct
+MDK-ARM/*.dep
+MDK-ARM/*.axf
+MDK-ARM/*.hex
+MDK-ARM/*.bin
+MDK-ARM/*.elf
+MDK-ARM/*.o
+MDK-ARM/*.obj
+MDK-ARM/*.d
+MDK-ARM/*.crf
+
+# Keil user/session files
+*.uvguix.*
+*.uvgui.*
+*.uvgui
+*.uvopt
+*.uvoptx.bak
+*.uvprojx.bak
+*.uvmpw
+*.uvmpw.*
+*.uv2
+*.uv2.*
+
+# Debugger and probe logs/settings
+JLinkLog.txt
+JLinkSettings.ini
+*.log
+
+# STM32CubeIDE / Eclipse local metadata
+.settings/
+.metadata/
+.cproject
+.project
+Debug/
+Release/
+
+# Generated dependency and object files
+*.o
+*.obj
+*.d
+*.dep
+*.crf
+*.lst
+*.map
+*.axf
+*.elf
+*.hex
+*.bin
+*.srec
+
+# Local temporary files
+tmp/
+*.tmp
+*.bak
+*.orig
+*.swp
+*.swo
+*~
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
