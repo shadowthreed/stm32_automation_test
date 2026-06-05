@@ -48,7 +48,7 @@ extern "C" {
 /* USER CODE BEGIN EM */
 #define VER_MAJOR		1
 #define VER_MINOR   0
-#define VER_PATCH   0
+#define VER_PATCH   1
 /* USER CODE END EM */
 
 /* Exported functions prototypes ---------------------------------------------*/

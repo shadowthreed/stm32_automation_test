@@ -257,6 +257,16 @@ function Get-GitHubApiHeaders {
     }
 }
 
+function Get-WebExceptionStatusCode {
+    param([object]$ErrorRecord)
+
+    if ($ErrorRecord.Exception.Response -and $ErrorRecord.Exception.Response.StatusCode) {
+        return [int]$ErrorRecord.Exception.Response.StatusCode
+    }
+
+    0
+}
+
 function Get-RemoteTagCommit {
     param(
         [string]$RemoteName,
@@ -271,7 +281,7 @@ function Get-RemoteTagCommit {
         try {
             $ref = Invoke-RestMethod -Method "Get" -Uri "$apiBase/git/ref/tags/$Tag" -Headers $headers
         } catch {
-            if ($_.Exception.Response.StatusCode.value__ -eq 404) {
+            if ((Get-WebExceptionStatusCode -ErrorRecord $_) -eq 404) {
                 return ""
             }
             throw "Could not query remote tag '$Tag' from GitHub API. Check GITHUB_TOKEN permissions and network access."
@@ -322,7 +332,8 @@ function Test-HeadExistsOnRemote {
             Invoke-RestMethod -Method "Get" -Uri "$apiBase/commits/$HeadCommit" -Headers $headers | Out-Null
             return $true
         } catch {
-            if ($_.Exception.Response.StatusCode.value__ -eq 404) {
+            $statusCode = Get-WebExceptionStatusCode -ErrorRecord $_
+            if ($statusCode -eq 404 -or $statusCode -eq 409 -or $statusCode -eq 422) {
                 return $false
             }
             throw "Could not query commit '$HeadCommit' from GitHub API. Check GITHUB_TOKEN permissions and network access."
@@ -340,6 +351,29 @@ function Test-HeadExistsOnRemote {
     }
 
     @($output | Where-Object { $_ -match "^$HeadCommit\s+" }).Count -gt 0
+}
+
+function Confirm-OverwriteExistingTag {
+    param(
+        [string]$Tag,
+        [string]$HeadCommit,
+        [string]$LocalTagCommit,
+        [string]$RemoteTagCommit
+    )
+
+    Write-Host ""
+    Write-Warning "Release tag already exists: $Tag"
+    Write-Host "HEAD commit:   $HeadCommit"
+    if (-not [string]::IsNullOrWhiteSpace($LocalTagCommit)) {
+        Write-Host "Local tag:     $LocalTagCommit"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($RemoteTagCommit)) {
+        Write-Host "Remote tag:    $RemoteTagCommit"
+    }
+    Write-Host "Overwrite will delete the GitHub Release if it exists, delete the remote tag, recreate the local tag at HEAD, then upload again."
+
+    $answer = Read-Host "Overwrite existing release/tag? Type 'y' to overwrite [N]"
+    $answer -eq "y" -or $answer -eq "Y" -or $answer -eq "yes" -or $answer -eq "YES"
 }
 
 function Invoke-Preflight {
@@ -396,17 +430,18 @@ function Invoke-Preflight {
         }
     }
 
+    $localTagCommit = ""
     & git rev-parse -q --verify "refs/tags/$Tag" *> $null
     if ($LASTEXITCODE -eq 0) {
-        $tagCommit = (& git rev-list -n 1 $Tag).Trim()
-        if ($tagCommit -ne $headCommit) {
-            throw "Local tag $Tag already exists but does not point to HEAD."
-        }
+        $localTagCommit = (& git rev-list -n 1 $Tag).Trim()
     }
 
     if ($IsDryRun) {
         Write-Host "Preflight OK"
-        return
+        return [PSCustomObject]@{
+            Repository = ""
+            OverwriteExistingTag = $false
+        }
     }
 
     $repository = Get-GitHubRepository -RemoteName $RemoteName
@@ -425,8 +460,14 @@ function Invoke-Preflight {
     }
 
     $remoteTagCommit = Get-RemoteTagCommit -RemoteName $RemoteName -Tag $Tag -Repository $repository
-    if (-not [string]::IsNullOrWhiteSpace($remoteTagCommit) -and $remoteTagCommit -ne $headCommit) {
-        throw "Remote tag $Tag already exists but does not point to HEAD."
+    $tagExists = (-not [string]::IsNullOrWhiteSpace($localTagCommit)) -or (-not [string]::IsNullOrWhiteSpace($remoteTagCommit))
+    $overwriteExistingTag = $false
+    if ($tagExists) {
+        $overwriteExistingTag = Confirm-OverwriteExistingTag -Tag $Tag -HeadCommit $headCommit -LocalTagCommit $localTagCommit -RemoteTagCommit $remoteTagCommit
+        if (-not $overwriteExistingTag) {
+            Write-Host "Release cancelled. Existing tag was not overwritten."
+            exit 0
+        }
     }
 
     if (-not (Test-HeadExistsOnRemote -RemoteName $RemoteName -HeadCommit $headCommit -Repository $repository)) {
@@ -434,7 +475,10 @@ function Invoke-Preflight {
     }
 
     Write-Host "Preflight OK"
-    $repository
+    [PSCustomObject]@{
+        Repository = $repository
+        OverwriteExistingTag = $overwriteExistingTag
+    }
 }
 
 function Publish-WithGh {
@@ -488,6 +532,92 @@ function Invoke-GitHubApi {
     }
 }
 
+function Remove-GitHubReleaseIfExists {
+    param(
+        [string]$Repository,
+        [string]$Tag,
+        [string]$GhPath
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($GhPath)) {
+        & $GhPath release view $Tag *> $null
+        if ($LASTEXITCODE -ne 0) {
+            return
+        }
+
+        Invoke-Checked -FilePath $GhPath -Arguments @("release", "delete", $Tag, "--yes") -ErrorMessage "Failed to delete GitHub Release $Tag with gh."
+        Write-Host "Deleted GitHub Release: $Tag"
+        return
+    }
+
+    $headers = Get-GitHubApiHeaders
+    $apiBase = "https://api.github.com/repos/$Repository"
+
+    try {
+        $release = Invoke-GitHubApi -Method "Get" -Uri "$apiBase/releases/tags/$Tag" -Headers $headers
+    } catch {
+        if ((Get-WebExceptionStatusCode -ErrorRecord $_) -eq 404) {
+            return
+        }
+        throw
+    }
+
+    Invoke-GitHubApi -Method "Delete" -Uri "$apiBase/releases/$($release.id)" -Headers $headers | Out-Null
+    Write-Host "Deleted GitHub Release: $Tag"
+}
+
+function Remove-RemoteTagIfExists {
+    param(
+        [string]$RemoteName,
+        [string]$Repository,
+        [string]$Tag
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN) -and -not [string]::IsNullOrWhiteSpace($Repository)) {
+        $headers = Get-GitHubApiHeaders
+        $apiBase = "https://api.github.com/repos/$Repository"
+
+        try {
+            Invoke-GitHubApi -Method "Delete" -Uri "$apiBase/git/refs/tags/$Tag" -Headers $headers | Out-Null
+            Write-Host "Deleted remote tag: $Tag"
+        } catch {
+            if ((Get-WebExceptionStatusCode -ErrorRecord $_) -eq 404) {
+                return
+            }
+            throw
+        }
+        return
+    }
+
+    Invoke-Checked -FilePath "git" -Arguments @("push", $RemoteName, ":refs/tags/$Tag") -ErrorMessage "Failed to delete remote tag $Tag."
+    Write-Host "Deleted remote tag: $Tag"
+}
+
+function Remove-LocalTagIfExists {
+    param([string]$Tag)
+
+    & git rev-parse -q --verify "refs/tags/$Tag" *> $null
+    if ($LASTEXITCODE -ne 0) {
+        return
+    }
+
+    Invoke-Checked -FilePath "git" -Arguments @("tag", "-d", $Tag) -ErrorMessage "Failed to delete local tag $Tag."
+}
+
+function Reset-ExistingReleaseAndTag {
+    param(
+        [string]$RemoteName,
+        [string]$Repository,
+        [string]$Tag,
+        [string]$GhPath
+    )
+
+    Write-Host "Overwriting existing release/tag: $Tag"
+    Remove-GitHubReleaseIfExists -Repository $Repository -Tag $Tag -GhPath $GhPath
+    Remove-RemoteTagIfExists -RemoteName $RemoteName -Repository $Repository -Tag $Tag
+    Remove-LocalTagIfExists -Tag $Tag
+}
+
 function Publish-WithApi {
     param(
         [string]$Repository,
@@ -517,7 +647,7 @@ function Publish-WithApi {
         } | ConvertTo-Json
         $release = Invoke-GitHubApi -Method "Patch" -Uri "$apiBase/releases/$($release.id)" -Headers $headers -ContentType "application/json" -Body $body
     } catch {
-        if ($_.Exception.Response.StatusCode.value__ -ne 404) {
+        if ((Get-WebExceptionStatusCode -ErrorRecord $_) -ne 404) {
             throw
         }
 
@@ -556,12 +686,13 @@ function Publish-WithApi {
 
 $tag = Get-FirmwareTag
 $releaseNotes = Get-ReleaseNotes -Tag $tag -OverrideNotes $Notes
-$repository = Invoke-Preflight `
+$preflight = Invoke-Preflight `
     -Tag $tag `
     -RemoteName $Remote `
     -IsDryRun ([bool]$DryRun) `
     -AllowDirtyTree ([bool]$AllowDirty) `
     -BuildSkipped ([bool]$SkipBuild)
+$repository = $preflight.Repository
 
 Write-Host "Release tag: $tag"
 if ($DryRun) {
@@ -587,6 +718,11 @@ if ($DryRun) {
     Write-Host ""
     Write-Host "Dry run complete. No tag was created, pushed, or uploaded."
     exit 0
+}
+
+if ($preflight.OverwriteExistingTag) {
+    $ghPath = Resolve-GhCommand
+    Reset-ExistingReleaseAndTag -RemoteName $Remote -Repository $repository -Tag $tag -GhPath $ghPath
 }
 
 & git rev-parse -q --verify "refs/tags/$tag" *> $null
